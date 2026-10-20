@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "59d03979-e2c4-4a4a-88df-e7e258427202",
+  "author": "FusionBridge contributors",
+  "description": {
+    "": "Local HTTP bridge so shell agents (Claude Code, Codex) can drive Fusion through the f360 CLI."
+  },
+  "version": "0.2.0",
+  "runOnStartup": true,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}

@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""b360: prepare reproducible Bambu Studio projects; cloud printing uses the logged-in GUI."""
+import argparse
+import json
+import sys
+import subprocess
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+
+from printbridge.jobs import handoff, prepare, record, status
+from printbridge.presets import PLATES, PURPOSES, Presets
+from printbridge.studio import doctor, inspect_project, locate
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--app', help='Bambu Studio .app or executable (default: installed macOS app)')
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('doctor', help='check installed Studio and CLI; does not log in or contact a printer')
+    s = sub.add_parser('presets', help='list complete, installed system preset choices')
+    s.add_argument('kind', choices=['machine', 'process', 'filament'])
+    s.add_argument('--search', default='')
+    s.add_argument('--compatible', help='exact printer preset name')
+    s = sub.add_parser('prepare', help='slice STL/3MF into a new, isolated job bundle')
+    s.add_argument('inputs', nargs='+')
+    s.add_argument('--out', required=True)
+    s.add_argument('--nozzle', choices=list(PURPOSES), default='0.4')
+    s.add_argument('--purpose', choices=['balanced', 'strength', 'detail', 'draft'], default='balanced')
+    s.add_argument('--filament', help='exact installed filament preset name; default: machine default')
+    s.add_argument('--process', help='exact installed process preset name')
+    s.add_argument('--plate', choices=list(PLATES), default='textured')
+    s.add_argument('--supports', choices=['auto', 'tree', 'none'], default='auto')
+    s.add_argument('--orientation', choices=['preserve', 'auto'], default='preserve')
+    s.add_argument('--set-process', nargs=2, action='append', default=[], metavar=('KEY', 'VALUE'))
+    s.add_argument('--timeout', type=float, default=600)
+    s = sub.add_parser('inspect', help='read settings, sliced plates and estimates from a 3MF')
+    s.add_argument('project')
+    s = sub.add_parser('handoff', help='verify hashes and describe cloud GUI submission; never prints')
+    s.add_argument('job')
+    s = sub.add_parser('status', help='read recorded cloud observations, not live telemetry')
+    s.add_argument('job')
+    s = sub.add_parser('record', help='record an observed cloud state; never contacts the printer')
+    s.add_argument('job')
+    s.add_argument('--state', required=True, choices=['submission_pending', 'submitted', 'printing',
+                                                   'completed', 'failed', 'unknown'])
+    s.add_argument('--printer', required=True)
+    s.add_argument('--evidence', required=True, help='what was actually observed in the Bambu GUI')
+    s.add_argument('--task-id')
+    args = parser.parse_args(argv)
+    try:
+        if args.command == 'doctor':
+            result = doctor(args.app)
+        elif args.command == 'presets':
+            result = {'ok': True, 'presets': Presets(locate(args.app)['profiles']).list(
+                args.kind, args.search, args.compatible)}
+        elif args.command == 'inspect':
+            result = inspect_project(args.project)
+        elif args.command == 'handoff':
+            result = handoff(args.job)
+        elif args.command == 'status':
+            result = status(args.job)
+        elif args.command == 'record':
+            result = record(args.job, args.state, args.printer, args.evidence, args.task_id)
+        else:
+            result = prepare(args.inputs, args.out, app=args.app, nozzle=args.nozzle,
+                             purpose=args.purpose, filament=args.filament, process=args.process,
+                             plate=args.plate, supports=args.supports, orientation=args.orientation,
+                             overrides=dict(args.set_process), timeout=args.timeout)
+            result = {'ok': True, 'job': str(Path(args.out).expanduser().resolve()), 'status': result['status'],
+                      'selection': result['selection'], 'project': result['project'],
+                      'cloud_state': result['cloud_state']}
+    except (ValueError, OSError, KeyError, zipfile.BadZipFile, ET.ParseError,
+            subprocess.SubprocessError) as error:
+        result = {'ok': False, 'error': str(error)}
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get('ok', True) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

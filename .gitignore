@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+result.json
+outputs/
+*.log
+
+# Local credentials and account/device configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+connection.json
+credentials.json
+*.local.json
+.fusion-bridge/
+private/
+
+# User projects and generated manufacturing evidence
+jobs/
+shots/
+export/
+exports/
+*.stl
+*.3mf
+*.f3d
+*.f3z
+*.step
+*.stp
+*.gcode
+*.gcode.3mf
+*.bak

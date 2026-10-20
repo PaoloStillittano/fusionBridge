@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""f360 - drive Autodesk Fusion from the shell through the FusionBridge add-in.
+
+Every command prints JSON (exec prints the script's stdout first) and exits
+0 = ok, 1 = the command failed inside Fusion, 2 = cannot reach the add-in.
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+import urllib.error
+import urllib.request
+
+CONFIG = os.path.join(os.path.expanduser('~'), '.fusion-bridge', 'connection.json')
+NOT_RUNNING = ('FusionBridge add-in is not running. In Fusion: Utilities > Add-Ins > '
+               'Scripts and Add-Ins > Add-Ins tab > FusionBridge > Run.')
+# Bypass any HTTP(S)_PROXY from the environment: the add-in is on localhost.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_DOCUMENT_ID = None
+
+
+def die(code, message):
+    print(json.dumps({'ok': False, 'error': message}, indent=2), file=sys.stderr)
+    sys.exit(code)
+
+
+def call(command, payload=None, timeout=120.0):
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        die(2, NOT_RUNNING)
+    body = dict(payload or {})
+    body['_timeout'] = timeout
+    if _DOCUMENT_ID is not None:
+        body['_document_id'] = _DOCUMENT_ID
+    req = urllib.request.Request(
+        'http://127.0.0.1:%d/%s' % (cfg['port'], command),
+        data=json.dumps(body).encode('utf-8'),
+        headers={'Content-Type': 'application/json', 'X-Bridge-Token': cfg['token']})
+    try:
+        with _OPENER.open(req, timeout=timeout + 15) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except ValueError:
+            return {'ok': False, 'error': 'HTTP %d from add-in' % e.code}
+    except (urllib.error.URLError, ConnectionError, socket.timeout) as e:
+        die(2, '%s (%s)' % (NOT_RUNNING, getattr(e, 'reason', e)))
+
+
+def emit(res):
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get('ok', True) else 1
+
+
+def emit_exec(res):
+    if res.get('stdout'):
+        sys.stdout.write(res['stdout'])
+        if not res['stdout'].endswith('\n'):
+            sys.stdout.write('\n')
+    if res.get('traceback'):
+        sys.stdout.write('--- error ---\n' + res['traceback'])
+    summary = {k: v for k, v in res.items() if k not in ('stdout', 'traceback')}
+    print('--- summary ---')
+    return emit(summary)
+
+
+def size(text):
+    try:
+        w, h = text.lower().split('x')
+        return int(w), int(h)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected WIDTHxHEIGHT, e.g. 1280x960')
+
+
+def bed(text):
+    try:
+        x, y, z = (float(v) for v in text.lower().split('x'))
+        return [x, y, z]
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected XxYxZ in mm, e.g. 256x256x256')
+
+
+def csv(text):
+    return [s.strip() for s in text.split(',') if s.strip()]
+
+
+def main(argv=None):
+    global _DOCUMENT_ID
+    p = argparse.ArgumentParser(prog='f360', description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--timeout', type=float, default=120.0, help='seconds (default 120)')
+    p.add_argument('--document-id', help='require the active creation ID returned by ping/tree')
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    sub.add_parser('ping', help='check the connection and the active document')
+
+    s = sub.add_parser('new', help='new parametric design document')
+    s.add_argument('--units', choices=['mm', 'cm', 'in'], default='mm')
+
+    s = sub.add_parser('save', help='save the active document (first time: give a name)')
+    s.add_argument('name', nargs='?')
+    s.add_argument('--description', default='')
+
+    s = sub.add_parser('exec', help='run a Python script inside Fusion')
+    s.add_argument('file', nargs='?', help="script path, or '-' for stdin")
+    s.add_argument('-c', '--code', help='inline code instead of a file')
+    s.add_argument('--keep-on-error', action='store_true',
+                   help='do not roll back the timeline when the script fails')
+
+    s = sub.add_parser('shot', help='save viewport screenshot(s)')
+    s.add_argument('-o', '--out', default='f360-shots/view.png')
+    s.add_argument('-v', '--views', type=csv, default=['iso'],
+                   help='comma list: iso,iso_back,iso_bottom,front,back,left,right,top,bottom,current')
+    s.add_argument('--size', type=size, default=(1280, 960))
+    s.add_argument('--style', choices=['shaded', 'edges', 'hidden', 'wire'], default='edges')
+    s.add_argument('--perspective', action='store_true')
+    s.add_argument('--keep-view', action='store_true', help='leave the camera on the last view')
+
+    sub.add_parser('tree', help='bodies, sketches, parameters, timeline (JSON)')
+
+    s = sub.add_parser('params', help='list user parameters, optionally setting some')
+    s.add_argument('--set', nargs=2, action='append', metavar=('NAME', 'EXPR'), default=[],
+                   help="e.g. --set wall '2.4 mm' (repeatable)")
+    s.add_argument('--unit', default='mm', help='unit for new parameters (default mm)')
+
+    s = sub.add_parser('export', help='export .stl / .3mf / .step / .f3d')
+    s.add_argument('path')
+    s.add_argument('--bodies', type=csv)
+    s.add_argument('--each', action='store_true', help='one file per body')
+    s.add_argument('--refine', choices=['low', 'medium', 'high'], default='high')
+
+    s = sub.add_parser('fdm', help='FDM printability check (overhangs, bed contact, size)')
+    s.add_argument('--bodies', type=csv)
+    s.add_argument('--overhang', type=float, default=45.0, help='degrees from vertical')
+    s.add_argument('--bed', type=bed, default=os.environ.get('F360_BED'),
+                   help='build volume XxYxZ mm (or env F360_BED)')
+    s.add_argument('--quality', choices=['low', 'normal', 'high'], default='normal')
+    s.add_argument('--mode', choices=['plate', 'part'], default='plate',
+                   help='plate: global bed and combined bounds; part: each body at its own base')
+    s.add_argument('--bed-z', type=float, default=0, help='global bed Z in mm (plate mode)')
+    s.add_argument('--strict', action='store_true', help='exit 1 when geometric checks need review')
+
+    s = sub.add_parser('rollback', help='delete timeline items after index N')
+    s.add_argument('to', type=int)
+
+    s = sub.add_parser('api', help='Fusion API docs from the live runtime')
+    s.add_argument('name', nargs='?', help='e.g. ExtrudeFeatures.createInput')
+    s.add_argument('--search', help='substring to search in class/member names')
+
+    sub.add_parser('reload', help='reload helpers/commands after editing the add-in')
+
+    a = p.parse_args(argv)
+    _DOCUMENT_ID = a.document_id
+    t = a.timeout
+
+    if a.cmd == 'exec':
+        if a.code is not None:
+            code, filename = a.code, '<inline>'
+        elif a.file in (None, '-'):
+            code, filename = sys.stdin.read(), '<stdin>'
+        else:
+            with open(a.file) as f:
+                code, filename = f.read(), os.path.basename(a.file)
+        return emit_exec(call('exec', {'code': code, 'filename': filename,
+                                       'rollback_on_error': not a.keep_on_error}, t))
+    if a.cmd == 'shot':
+        w, h = a.size
+        return emit(call('screenshot', {'path': os.path.abspath(a.out), 'views': a.views,
+                                        'width': w, 'height': h, 'style': a.style,
+                                        'perspective': a.perspective,
+                                        'restore': not a.keep_view}, t))
+    if a.cmd == 'params':
+        specs = [{'name': n, 'expression': e, 'unit': a.unit} for n, e in a.set]
+        return emit(call('params', {'set': specs}, t))
+    if a.cmd == 'export':
+        return emit(call('export', {'path': os.path.abspath(a.path), 'bodies': a.bodies,
+                                    'each': a.each, 'refine': a.refine}, t))
+    if a.cmd == 'fdm':
+        bed_size = bed(a.bed) if isinstance(a.bed, str) else a.bed
+        return emit(call('fdm', {'bodies': a.bodies, 'overhang': a.overhang, 'bed': bed_size,
+                                 'quality': a.quality, 'mode': a.mode, 'bed_z': a.bed_z,
+                                 'strict': a.strict}, t))
+    if a.cmd == 'api':
+        if not a.name and not a.search:
+            p.error('api needs NAME or --search TERM')
+        return emit(call('api', {'name': a.name, 'search': a.search}, t))
+    if a.cmd == 'new':
+        return emit(call('new', {'units': a.units}, t))
+    if a.cmd == 'save':
+        return emit(call('save', {'name': a.name, 'description': a.description}, t))
+    if a.cmd == 'rollback':
+        return emit(call('rollback', {'to': a.to}, t))
+    return emit(call(a.cmd, {}, t))  # ping, tree, reload
+
+
+if __name__ == '__main__':
+    sys.exit(main())
